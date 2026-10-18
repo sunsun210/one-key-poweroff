@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=@APP_NAME@
+Name[zh_CN]=一键关机
+Name[en_US]=One-Key Poweroff
+GenericName=Power Off
+Comment=@APP_COMMENT@
+Comment[zh_CN]=立即关闭计算机（调用 poweroff 命令）
+Comment[en_US]=Shut down the computer immediately using poweroff
+Exec=@PREFIX@/bin/one-key-poweroff --gui
+Icon=@ICON_NAME@
+Terminal=false
+Categories=@APP_CATEGORIES@
+Keywords=poweroff;shutdown;power;off;关机;断电;
+StartupNotify=true
+StartupWMClass=OneKeyPoweroff

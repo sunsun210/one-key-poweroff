@@ -1,0 +1,541 @@
+#!/bin/bash
+# ==============================================================================
+#  one-key-poweroff —— Loongnix 25.1 一键关机应用
+#
+#  作用：以图形界面（或命令行）的方式，安全、可确认地调用系统 poweroff 关机。
+#
+#  用法：
+#    one-key-poweroff                 打开图形界面（默认）
+#    one-key-poweroff --gui           同上
+#    one-key-poweroff --now           立即关机，不做任何确认（适合桌面快捷键）
+#    one-key-poweroff --delay 60      60 秒后关机（可随时用 --cancel 取消）
+#    one-key-poweroff --cancel        取消已计划的关机
+#    one-key-poweroff --status        查看是否有计划中的关机
+#    one-key-poweroff --dry-run       只打印将要执行的命令，不真正关机（测试用）
+#    one-key-poweroff --no-wall       关机前不广播通知其他登录用户
+#
+#  退出码：0 成功 / 1 一般错误 / 2 参数错误 / 3 权限不足 / 4 已取消
+# ==============================================================================
+
+set -u
+set -o pipefail
+
+# ---------- 配置加载 ----------
+# 优先使用安装时写入的同目录 config.sh，回退到系统级配置
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+    __link="$(readlink "$SELF")"
+    case "$__link" in
+        /*) SELF="$__link" ;;
+        *)  SELF="$(cd "$(dirname "$SELF")" && pwd)/$__link" ;;
+    esac
+done
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+for __cfg in \
+    "$SELF_DIR/../share/one-key-poweroff/config.sh" \
+    "$SELF_DIR/config.sh" \
+    "/usr/share/one-key-poweroff/config.sh" \
+    "/usr/local/share/one-key-poweroff/config.sh"
+do
+    if [ -r "$__cfg" ]; then
+        # shellcheck source=/dev/null
+        . "$__cfg"
+        break
+    fi
+done
+
+# ---------- 命令路径自动探测 ----------
+# 不同发行版 poweroff 位于 /usr/bin、/bin、/sbin、/usr/sbin，不能写死。
+find_cmd() {
+    local name="$1" c
+    c="$(command -v "$name" 2>/dev/null)" && { printf '%s' "$c"; return 0; }
+    for c in /usr/bin "/usr/sbin" /bin /sbin; do
+        if [ -x "$c/$name" ]; then printf '%s' "$c/$name"; return 0; fi
+    done
+    return 1
+}
+
+# ---------- 默认值（配置缺失时兜底） ----------
+: "${POWEROFF_BIN:=$(find_cmd poweroff || echo /usr/bin/poweroff)}"
+: "${SYSTEMCTL_BIN:=$(find_cmd systemctl || echo /usr/bin/systemctl)}"
+: "${ZENITY_BIN:=$(find_cmd zenity || echo /usr/bin/zenity)}"
+: "${DEFAULT_DELAY:=0}"
+: "${CONFIRM:=1}"
+: "${WALL:=1}"
+: "${POWER_CMD:=poweroff}"
+: "${LOG_SUBDIR:=.local/state/one-key-poweroff}"
+: "${LOG_MAX_LINES:=500}"
+: "${USE_JOURNAL:=0}"
+: "${APP_NAME:=一键关机}"
+
+PROG="one-key-poweroff"
+# 兼容旧配置里的 LOG_DIR，否则用 家目录 + LOG_SUBDIR
+LOG_DIR="${LOG_DIR:-$HOME/${LOG_SUBDIR#/}}"
+# 若配置里遗留了未展开的字面量，兜底修正
+case "$LOG_DIR" in *'$HOME'*) LOG_DIR="$HOME/${LOG_SUBDIR#/}" ;; esac
+LOG_FILE="${LOG_DIR}/poweroff.log"
+
+# ---------- 颜色（仅终端输出用） ----------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED=$'\033[31m'; C_YEL=$'\033[33m'; C_GRN=$'\033[32m'
+    C_RST=$'\033[0m'; C_BLD=$'\033[1m'
+else
+    C_RED=""; C_YEL=""; C_GRN=""; C_RST=""; C_BLD=""
+fi
+
+# ---------- 日志 ----------
+log() {
+    local level="$1"; shift
+    local msg="$*"
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    # 文件日志（失败静默，不影响主流程）
+    if mkdir -p "$LOG_DIR" 2>/dev/null; then
+        printf '%s [%s] %s\n' "$ts" "$level" "$msg" >>"$LOG_FILE" 2>/dev/null
+        # 日志轮转：超过上限只保留尾部
+        local lines
+        lines=$(wc -l <"$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$lines" -gt "$LOG_MAX_LINES" ] 2>/dev/null; then
+            tail -n "$LOG_MAX_LINES" "$LOG_FILE" >"${LOG_FILE}.tmp" 2>/dev/null \
+                && mv -f "${LOG_FILE}.tmp" "$LOG_FILE" 2>/dev/null
+        fi
+    fi
+    if [ "$USE_JOURNAL" = "1" ] && command -v logger >/dev/null 2>&1; then
+        logger -t "$PROG" -p "user.$level" -- "$msg" 2>/dev/null || true
+    fi
+}
+
+# 终端提示
+say()  { printf '%s%s%s\n' "$C_BLD" "$*" "$C_RST"; }
+warn() { printf '%s警告：%s%s\n' "$C_YEL" "$*" "$C_RST" >&2; log warn "$*"; }
+err()  { printf '%s错误：%s%s\n' "$C_RED" "$*" "$C_RST" >&2; log err  "$*"; }
+ok()   { printf '%s%s%s\n' "$C_GRN" "$*" "$C_RST"; }
+
+# ---------- 图形/文本对话框抽象 ----------
+HAS_ZENITY=0
+if [ -x "$ZENITY_BIN" ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    HAS_ZENITY=1
+fi
+# 界面标题里带图标名，让窗口显示应用图标
+ZTITLE="--title=${APP_NAME}"
+ZICON="--window-icon=one-key-poweroff"
+
+has_zenity() { [ "$HAS_ZENITY" = "1" ]; }
+
+ui_error() {
+    if has_zenity; then
+        zenity --error --no-markup "$ZTITLE" "$ZICON" --width=380 --text="$*" 2>/dev/null
+    else
+        err "$*"
+    fi
+}
+ui_info() {
+    if has_zenity; then
+        zenity --info --no-markup "$ZTITLE" "$ZICON" --width=380 --text="$*" 2>/dev/null
+    else
+        say "$*"
+    fi
+}
+
+# 确认对话框；返回 0 = 用户点了“关机”
+ui_confirm() {
+    local text="$1"
+    # 演练模式不弹任何窗口，直接视为“已确认”，便于脚本化测试
+    if [ "$DRY_RUN" = "1" ]; then
+        log info "dry-run：跳过确认框（视为已确认）"
+        return 0
+    fi
+    if has_zenity; then
+        # 给“取消”加默认焦点，避免回车误关机：先尝试 zenity 的 --default-cancel
+        if zenity --help 2>/dev/null | grep -q -- '--default-cancel'; then
+            zenity --question "$ZTITLE" "$ZICON" --width=400 \
+                   --ok-label="立即关机" --cancel-label="取消" \
+                   --default-cancel --text="$text" 2>/dev/null
+        else
+            zenity --question "$ZTITLE" "$ZICON" --width=400 \
+                   --ok-label="立即关机" --cancel-label="取消" \
+                   --text="$text" 2>/dev/null
+        fi
+        return $?
+    fi
+    # 无图形环境：终端确认
+    local ans
+    printf '%s [y/N] ' "$text"
+    read -r ans
+    case "$ans" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------- 权限判断 ----------
+can_poweroff() {
+    [ "$(id -u)" -eq 0 ] && return 0
+    # polkit 授权检查：交互式会话中通常可弹认证框
+    if command -v pkcheck >/dev/null 2>&1; then
+        pkcheck --action-id org.freedesktop.login1.power-off \
+                --process $$ --allow-user-interaction >/dev/null 2>&1 && return 0
+        # 非交互式检查（部分系统不支持 --allow-user-interaction）
+        pkcheck --action-id org.freedesktop.login1.power-off --process $$ >/dev/null 2>&1 && return 0
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --dry-run poweroff >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+# ---------- 核心：执行关机 ----------
+# 参数：delay_seconds  extra_wall(1/0)
+do_poweroff() {
+    local delay="${1:-0}"
+    local wall="${2:-$WALL}"
+    local -a cmd
+
+    # 根据 POWER_CMD 组装命令
+    case "$POWER_CMD" in
+        "systemctl poweroff"|systemctl*)
+            cmd=("${SYSTEMCTL_BIN}" poweroff)
+            ;;
+        *)
+            cmd=("${POWEROFF_BIN}")
+            # poweroff 的 -p/--poweroff 显式要求“关闭电源”。
+            # 注意：部分 systemd 版本的 --help 里这些选项没有 “--” 前缀，
+            # 因此同时匹配 "poweroff" 与 "--poweroff"，这里只做宽松判断。
+            if [ -x "${POWEROFF_BIN}" ] \
+               && "${POWEROFF_BIN}" --help 2>/dev/null | grep -qE '(^|[[:space:]-])-p([,[:space:]]|$)|--poweroff'; then
+                cmd+=(--poweroff)
+            fi
+            ;;
+    esac
+
+    [ "$wall" = "0" ] && cmd+=(--no-wall)
+
+    # 注意：poweroff 本身不接受时间参数（实测报 "Too many arguments"）。
+    # 延迟关机须用 shutdown -h +分钟（sysvinit 与 systemd 通用），
+    # 期间可用 shutdown -c / 本工具 --cancel 取消。
+    if [ "$delay" -gt 0 ] 2>/dev/null; then
+        local mins=$(( (delay + 59) / 60 ))
+        [ "$mins" -lt 1 ] && mins=1
+        log info "延迟 ${delay} 秒（${mins} 分钟）关机，使用 shutdown -h +${mins}"
+        if [ "$DRY_RUN" = "1" ]; then
+            say "[dry-run] 将要执行：shutdown -h +${mins}"
+            return 0
+        fi
+        local sbin
+        sbin="$(command -v shutdown || echo /sbin/shutdown)"
+        if "$sbin" -h "+${mins}"; then
+            log info "已计划 ${mins} 分钟后关机"
+            ui_info "已计划 ${mins} 分钟后关机，可随时执行
+${SELF} --cancel 取消。"
+            return 0
+        fi
+        log err "shutdown -h +${mins} 失败，退出码 $?"
+        ui_error "计划延时关机失败（shutdown 命令错误）。详见日志：${LOG_FILE}"
+        return 3
+    fi
+
+    if [ "$DRY_RUN" = "1" ]; then
+        say "[dry-run] 将要执行：${cmd[*]}"
+        log info "dry-run: ${cmd[*]}"
+        return 0
+    fi
+
+    log info "执行关机：${cmd[*]}（用户 $(id -un) uid=$(id -u)）"
+
+    # 真正调用。非交互式下 polkit 可能弹窗认证。
+    if "${cmd[@]}"; then
+        log info "关机命令已提交"
+        return 0
+    fi
+
+    local rc=$?
+    log err "关机命令失败，退出码 $rc：${cmd[*]}"
+
+    # 失败兜底：尝试 systemctl（若尚未使用）
+    if [ "${cmd[0]}" != "$SYSTEMCTL_BIN" ]; then
+        log warn "尝试回退到 systemctl poweroff"
+        if "${SYSTEMCTL_BIN}" poweroff 2>>"$LOG_FILE"; then
+            return 0
+        fi
+    fi
+
+    # 再兜底：sudo -n（仅当已配置免密时可用）
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        log warn "尝试回退到 sudo -n poweroff"
+        if sudo -n "${cmd[@]}" 2>>"$LOG_FILE"; then
+            return 0
+        fi
+    fi
+
+    ui_error "无法执行关机命令。
+
+可能原因：
+1. 当前会话未获得 polkit 授权（请通过桌面菜单启动，而非 SSH 终端）
+2. 账户没有 sudo / 关机权限
+3. 系统正在执行其他维护任务
+
+技术细节已记录到：
+${LOG_FILE}"
+    return 3
+}
+
+# ---------- 关闭图形会话（可选，让关机过程更“干净”） ----------
+# 说明：poweroff 本身由 systemd 正常序列化停止各个服务，
+# 这里不强制 kill 会话，避免破坏正在保存的文件。
+
+# ---------- 图形界面主流程 ----------
+run_gui() {
+    log info "GUI 启动（DISPLAY=${DISPLAY:-无} WAYLAND=${WAYLAND_DISPLAY:-无}）"
+
+    if ! has_zenity; then
+        # 没有 zenity：尝试用终端界面兜底
+        if [ -t 0 ]; then
+            warn "未检测到图形对话框组件（zenity），已切换到终端确认模式。"
+            return "$(run_confirm "$DEFAULT_DELAY")"
+        fi
+        # 完全没有交互能力：直接执行（用于快捷键场景）
+        warn "无图形界面可用，直接执行关机。"
+        do_poweroff "$DEFAULT_DELAY" "$WALL"
+        return $?
+    fi
+
+    # 倒计时阶段（当 DEFAULT_DELAY > 0 时先给出确认 + 倒计时）
+    local delay="$DEFAULT_DELAY"
+
+    if [ "$CONFIRM" = "1" ]; then
+        local msg="确定要关闭计算机吗？
+
+系统将立即结束所有正在运行的程序，未保存的工作会丢失。
+如果有未保存的文件，请先取消并保存。
+
+　· 确认关机后无法撤销
+　· 若需稍后关机，可使用 --delay 参数"
+        if [ "$delay" -gt 0 ] 2>/dev/null; then
+            msg="确定要在 ${delay} 秒后关闭计算机吗？
+
+关闭前会有倒计时，期间可随时取消。"
+        fi
+
+        if ! ui_confirm "$msg"; then
+            log info "用户取消关机"
+            return 4
+        fi
+    fi
+
+    if [ "$delay" -gt 0 ] 2>/dev/null; then
+        # 倒计时进度条，用户可点“取消”
+        (
+            for ((i = delay; i > 0; i--)); do
+                pct=$(( (delay - i) * 100 / delay ))
+                printf '%s\n# 系统将在 %d 秒后关机…\n# 点击“取消关机”可中止\n' "$pct" "$i"
+                sleep 1
+            done
+            printf '100\n# 正在关机…\n'
+        ) | zenity --progress "$ZTITLE" "$ZICON" \
+                   --title="${APP_NAME} - 倒计时" \
+                   --text="准备关机…" --percentage=0 --auto-close \
+                   --ok-label="立即关机" --cancel-label="取消关机" 2>/dev/null
+        # zenity --progress 被取消时返回非 0
+        if [ $? -ne 0 ]; then
+            log info "用户在倒计时中取消关机"
+            # 若已有计划任务也一并取消
+            [ -x "$(command -v shutdown)" ] && shutdown -c >/dev/null 2>&1
+            ui_info "已取消关机。"
+            return 4
+        fi
+    fi
+
+    do_poweroff "$delay" "$WALL"
+    return $?
+}
+
+# 终端确认流程
+run_confirm() {
+    local delay="${1:-$DEFAULT_DELAY}"
+    say "${APP_NAME}"
+    if [ "$CONFIRM" = "1" ]; then
+        ui_confirm "确定要关闭计算机吗？未保存的工作会丢失。" || { log info "用户取消"; return 4; }
+    fi
+    do_poweroff "$delay" "$WALL"
+}
+
+# ---------- 命令行入口 ----------
+DRY_RUN=0
+MODE="gui"
+DELAY_OVERRIDE=""
+WALL_OVERRIDE="$WALL"
+
+usage() {
+    cat <<'EOF'
+一键关机 —— Loongnix 25.1
+
+用法：one-key-poweroff [选项]
+
+  （无参数）        打开图形界面（默认）
+  --gui             打开图形界面
+  --now             立即关机，不弹确认框（适合绑定桌面快捷键）
+  --confirm         关机前弹出确认框
+  --delay <秒>      延时关机，期间可用 --cancel 取消
+  --cancel          取消已计划的关机
+  --status          查看是否有计划中的关机
+  --no-wall         关机前不向其他登录用户广播
+  --dry-run         只打印命令，不真正执行（测试用）
+  -h, --help        显示本帮助
+  -v, --version     显示版本
+
+示例：
+  one-key-poweroff --now                  # 快捷键：一按即关
+  one-key-poweroff --delay 300            # 5 分钟后关机
+  one-key-poweroff --cancel               # 反悔
+  one-key-poweroff --dry-run --now        # 验证命令是否正确
+
+配置：/usr/share/one-key-poweroff/config.sh（或 /etc/one-key-poweroff.conf）
+日志：~/.local/state/one-key-poweroff/poweroff.log
+EOF
+}
+
+VERSION="1.0.0"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --gui)        MODE="gui" ;;
+        --now)        MODE="now" ;;
+        --confirm)    MODE="confirm" ;;
+        --delay)      MODE="delay"; DELAY_OVERRIDE="${2:-}"; shift || true ;;
+        --delay=*)    MODE="delay"; DELAY_OVERRIDE="${1#*=}" ;;
+        --cancel)     MODE="cancel" ;;
+        --status)     MODE="status" ;;
+        --no-wall)    WALL_OVERRIDE=0 ;;
+        --wall)       WALL_OVERRIDE=1 ;;
+        --dry-run)    DRY_RUN=1 ;;
+        --log)        MODE="log" ;;
+        -h|--help)    usage; exit 0 ;;
+        -v|--version) echo "$PROG $VERSION"; exit 0 ;;
+        *)
+            err "未知参数：$1"
+            echo "使用 --help 查看用法。" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+# ---------- 参数校验 ----------
+if [ "$MODE" = "delay" ]; then
+    if ! printf '%s' "$DELAY_OVERRIDE" | grep -Eq '^[0-9]+$'; then
+        err "--delay 需要一个非负整数（秒），收到：'${DELAY_OVERRIDE}'"
+        exit 2
+    fi
+    if [ "$DELAY_OVERRIDE" -gt 86400 ]; then
+        err "--delay 最大 86400 秒（24 小时）"
+        exit 2
+    fi
+fi
+
+# ---------- 各模式执行 ----------
+case "$MODE" in
+    status)
+        if [ -x "$(command -v shutdown)" ] && shutdown --show 2>/dev/null | grep -q .; then
+            say "存在计划中的关机/重启任务："
+            shutdown --show 2>/dev/null
+            exit 0
+        fi
+        # logind 视角查看
+        if command -v busctl >/dev/null 2>&1; then
+            sched=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+                    org.freedesktop.login1.Manager ScheduledShutdown 2>/dev/null)
+            if [ -n "${sched:-}" ] && ! printf '%s' "$sched" | grep -q '"none"'; then
+                say "logind 计划任务：$sched"
+                exit 0
+            fi
+        fi
+        ok "当前没有计划中的关机。"
+        exit 0
+        ;;
+
+    cancel)
+        log info "请求取消关机"
+        cancelled=0
+        if command -v shutdown >/dev/null 2>&1; then
+            shutdown -c >/dev/null 2>&1 && cancelled=1
+        fi
+        # 关掉本工具启动的倒计时子进程（若有）
+        pkill -f "one-key-poweroff.*--delay" >/dev/null 2>&1 || true
+        if [ "$cancelled" = "1" ]; then
+            log info "已取消关机"
+            [ -t 1 ] && ok "已取消关机。" || ui_info "已取消关机。"
+            exit 0
+        fi
+        log warn "没有可取消的关机任务"
+        [ -t 1 ] && warn "没有可取消的关机任务。" || ui_info "当前没有计划中的关机，无需取消。"
+        exit 0
+        ;;
+
+    log)
+        if [ -r "$LOG_FILE" ]; then
+            tail -n 50 "$LOG_FILE"
+        else
+            say "暂无日志：$LOG_FILE"
+        fi
+        exit 0
+        ;;
+
+    now)
+        log info "--now 立即关机"
+        if [ "$CONFIRM" = "1" ] && has_zenity; then
+            # 即使 --now，默认也保留一道确认（可通过配置 CONFIRM=0 关闭）
+            ui_confirm "确定要立即关闭计算机吗？
+
+未保存的工作会丢失。" || { log info "用户取消"; exit 4; }
+        fi
+        do_poweroff 0 "$WALL_OVERRIDE"
+        exit $?
+        ;;
+
+    confirm)
+        run_confirm 0
+        exit $?
+        ;;
+
+    delay)
+        log info "--delay ${DELAY_OVERRIDE} 秒后关机"
+        # dry-run 只验证命令拼装，不弹窗、不倒计时
+        if [ "$DRY_RUN" != "1" ] && has_zenity; then
+            if ! ui_confirm "确定要在 ${DELAY_OVERRIDE} 秒后关闭计算机吗？
+
+倒计时期间可点击“取消关机”中止。"; then
+                log info "用户取消"; exit 4
+            fi
+            # 复用 GUI 倒计时逻辑
+            (
+                for ((i = DELAY_OVERRIDE; i > 0; i--)); do
+                    printf '%s\n# 系统将在 %d 秒后关机…\n' \
+                        $(( (DELAY_OVERRIDE - i) * 100 / DELAY_OVERRIDE )) "$i"
+                    sleep 1
+                done
+                printf '100\n# 正在关机…\n'
+            ) | zenity --progress "$ZTITLE" "$ZICON" \
+                       --title="${APP_NAME} - 倒计时" \
+                       --text="准备关机…" --percentage=0 --auto-close \
+                       --ok-label="立即关机" --cancel-label="取消关机" 2>/dev/null
+            if [ $? -ne 0 ]; then
+                log info "倒计时中取消"
+                shutdown -c >/dev/null 2>&1 || true
+                ui_info "已取消关机。"
+                exit 4
+            fi
+        else
+            if [ "$CONFIRM" = "1" ]; then
+                ui_confirm "确定要在 ${DELAY_OVERRIDE} 秒后关闭计算机吗？" || exit 4
+            fi
+        fi
+        do_poweroff "$DELAY_OVERRIDE" "$WALL_OVERRIDE"
+        exit $?
+        ;;
+
+    gui|*)
+        run_gui
+        exit $?
+        ;;
+esac
